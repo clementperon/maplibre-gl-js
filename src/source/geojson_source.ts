@@ -9,6 +9,7 @@ import {getGeoJSONBounds} from '../util/geojson_bounds.ts';
 import {isAbortError} from '../util/abort_error.ts';
 import {MessageType} from '../util/actor_messages.ts';
 import {tileIdToLngLatBounds} from '../tile/tile_id_to_lng_lat_bounds.ts';
+import {UpdateQueue} from '../util/update_queue.ts';
 
 import type {LngLatBounds} from '../geo/lng_lat_bounds.ts';
 import type {Source} from './source.ts';
@@ -88,6 +89,11 @@ export type GetClusterOptions = {
 };
 
 /**
+ * One update of a source's data in the worker.
+ */
+type GeoJSONWorkerUpdate = {data: GeoJSON.GeoJSON | string} | {diff: GeoJSONSourceDiff} | {updateCluster: true};
+
+/**
  * A source containing GeoJSON.
  * (See the [Style Specification](https://maplibre.org/maplibre-style-spec/#sources-geojson) for detailed documentation of options.)
  *
@@ -163,13 +169,7 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
     workerOptions: GeoJSONWorkerOptions;
     map: Map;
     actorPromise: Promise<Actor>;
-    _isUpdatingWorker: boolean;
-    _updatePromise: Promise<void>;
-    _pendingWorkerUpdate: {
-        data?: GeoJSON.GeoJSON | string;
-        diff?: GeoJSONSourceDiff;
-        updateCluster?: boolean;
-    };
+    _workerUpdates: UpdateQueue<GeoJSONWorkerUpdate, GeoJSONWorkerSourceLoadDataResult>;
     _collectResourceTiming: boolean;
     _removed: boolean;
 
@@ -189,8 +189,12 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
         this.isTileClipped = true;
         this.reparseOverscaled = true;
         this._removed = false;
-        this._isUpdatingWorker = false;
-        this._pendingWorkerUpdate = {data: options.data};
+        this._workerUpdates = new UpdateQueue({
+            send: (update) => this._sendWorkerUpdate(update),
+            onResult: (update, result) => this._onWorkerUpdateResult(update, result),
+            onError: (_update, error) => this._onWorkerUpdateError(error)
+        });
+        if (options.data !== undefined) this._workerUpdates.enqueue({data: options.data});
 
         this.actorPromise = dispatcher.getActor();
         this.setEventedParent(eventedParent);
@@ -243,10 +247,6 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
         return typeof this.promoteId === 'string' ? this.promoteId : undefined;
     }
 
-    private _hasPendingWorkerUpdate(): boolean {
-        return this._pendingWorkerUpdate.data !== undefined || this._pendingWorkerUpdate.diff !== undefined || this._pendingWorkerUpdate.updateCluster;
-    }
-
     private _pixelsToTileUnits(pixelValue: number): number {
         return pixelValue * (EXTENT / this.tileSize);
     }
@@ -264,7 +264,11 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
     }
 
     async load(): Promise<void> {
-        await this._updateWorkerData();
+        if (this._workerUpdates.idle) {
+            warnOnce(`No pending worker updates for GeoJSONSource ${this.id}.`);
+            return;
+        }
+        await this._workerUpdates.flush();
     }
 
     onAdd(map: Map): void {
@@ -279,8 +283,8 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
      */
     setData(data: GeoJSON.GeoJSON | string): Promise<void> {
         this._data = typeof data === 'string' ? {url: data} : {geojson: data};
-        this._pendingWorkerUpdate = {data};
-        return this._updateWorkerData();
+        this._workerUpdates.replace({data});
+        return this._workerUpdates.flush();
     }
 
     /**
@@ -298,8 +302,10 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
      * @param diff - The changes that need to be applied.
      */
     updateData(diff: GeoJSONSourceDiff): Promise<void> {
-        this._pendingWorkerUpdate.diff = mergeSourceDiffs(this._pendingWorkerUpdate.diff, diff, this._promoteIdKey);
-        return this._updateWorkerData();
+        this._workerUpdates.enqueue({diff}, (last, update) =>
+            'diff' in last && 'diff' in update ? {diff: mergeSourceDiffs(last.diff, update.diff, this._promoteIdKey)} : undefined
+        );
+        return this._workerUpdates.flush();
     }
 
     /**
@@ -346,8 +352,8 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
         if (options.clusterMaxZoom !== undefined) {
             this.workerOptions.geojsonVtOptions.clusterOptions.maxZoom = this._getClusterMaxZoom(options.clusterMaxZoom);
         }
-        this._pendingWorkerUpdate.updateCluster = true;
-        return this._updateWorkerData();
+        this._workerUpdates.enqueue({updateCluster: true}, (last) => 'updateCluster' in last ? last : undefined);
+        return this._workerUpdates.flush();
     }
 
     /**
@@ -425,112 +431,67 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
     }
 
     /**
+     * Create the parameters object that will be sent to the worker and used to load GeoJSON.
+     */
+    private async _getLoadGeoJSONParameters(update: GeoJSONWorkerUpdate): Promise<LoadGeoJSONParameters> {
+        const params: LoadGeoJSONParameters = extend({type: this.type, source: this.id}, this.workerOptions);
+
+        if ('data' in update) {
+            // Data comes from a remote url
+            if (typeof update.data === 'string') {
+                params.request = await this.map._requestManager.transformRequest(browser.resolveURL(update.data), ResourceType.Source);
+                params.request.collectResourceTiming = this._collectResourceTiming;
+            } else {
+                params.data = update.data;
+            }
+        } else if ('diff' in update) {
+            params.dataDiff = update.diff;
+        } else {
+            // Update supercluster with the latest worker cluster options
+            params.updateCluster = true;
+        }
+        return params;
+    }
+
+    /**
      * Responsible for invoking WorkerSource's geojson.loadData target, which
      * handles loading the geojson data and preparing to serve it up as tiles,
      * using geojson-vt or supercluster as appropriate.
      */
-    async _updateWorkerData(): Promise<void> {
-        if (this._isUpdatingWorker) return this._updatePromise;
+    private async _sendWorkerUpdate(update: GeoJSONWorkerUpdate): Promise<GeoJSONWorkerSourceLoadDataResult> {
+        this.fire(new MapSourceDataEvent('dataloading'));
+        const params = await this._getLoadGeoJSONParameters(update);
+        return (await this.actorPromise).sendAsync({type: MessageType.loadData, data: params});
+    }
 
-        if (!this._hasPendingWorkerUpdate()) {
-            warnOnce(`No pending worker updates for GeoJSONSource ${this.id}.`);
+    private _onWorkerUpdateResult(update: GeoJSONWorkerUpdate, result: GeoJSONWorkerSourceLoadDataResult) {
+        if (this._removed || result.abandoned) {
+            this.fire(new MapSourceDataEvent('dataabort'));
             return;
         }
 
-        const {data, diff, updateCluster} = this._pendingWorkerUpdate;
-        // delay awaiting params until _isUpdatingWorker is set, otherwise, a race condition could happen
-        const params = this._getLoadGeoJSONParameters(data, diff, updateCluster);
-
-        if (data !== undefined) {
-            this._pendingWorkerUpdate.data = undefined;
-        } else if (diff) {
-            this._pendingWorkerUpdate.diff = undefined;
-        } else if (updateCluster) {
-            this._pendingWorkerUpdate.updateCluster = undefined;
+        // Update the copy of the data in this source with the worker result. (only sent for url based geojson data)
+        if (result.data) {
+            this._data = {geojson: result.data};
         }
 
-        this._updatePromise = this._dispatchWorkerUpdate(params);
-        await this._updatePromise;
+        const affectedGeometries = this._applyDiffToSource('diff' in update ? update.diff : undefined);
+        const shouldReloadTileOptions = this._getShouldReloadTileOptions(affectedGeometries);
+
+        const eventData: {resourceTiming?: PerformanceResourceTiming[]} = {};
+        this._applyResourceTiming(eventData, result);
+
+        // Fire the metadata event to let the TileManager know it's ok to start requesting tiles.
+        this.fire(new MapSourceDataEvent('data', {...eventData, sourceDataType: 'metadata'}));
+        this.fire(new MapSourceDataEvent('data', {...eventData, sourceDataType: 'content', shouldReloadTileOptions}));
     }
 
-    /**
-     * Create the parameters object that will be sent to the worker and used to load GeoJSON.
-     */
-    private async _getLoadGeoJSONParameters(data: string | GeoJSON.GeoJSON<GeoJSON.Geometry>, diff: GeoJSONSourceDiff, updateCluster: boolean): Promise<LoadGeoJSONParameters | undefined> {
-        const params: LoadGeoJSONParameters = extend({type: this.type, source: this.id}, this.workerOptions);
-
-        // Data comes from a remote url
-        if (typeof data === 'string') {
-            params.request = await this.map._requestManager.transformRequest(browser.resolveURL(data), ResourceType.Source);
-            params.request.collectResourceTiming = this._collectResourceTiming;
-            return params;
+    private _onWorkerUpdateError(error: unknown) {
+        if (this._removed) {
+            this.fire(new MapSourceDataEvent('dataabort'));
+            return;
         }
-
-        // Data is a geojson object
-        if (data !== undefined) {
-            params.data = data;
-            return params;
-        }
-
-        // Data is a differential update
-        if (diff) {
-            params.dataDiff = diff;
-            return params;
-        }
-
-        // Update supercluster with the latest worker cluster options
-        if (updateCluster) {
-            params.updateCluster = true;
-            return params;
-        }
-    }
-
-    /**
-     * Send the worker update data from the main thread to the worker
-     */
-    private async _dispatchWorkerUpdate(optionsPromise: Promise<LoadGeoJSONParameters>) {
-        this._isUpdatingWorker = true;
-        this.fire(new MapSourceDataEvent('dataloading'));
-
-        try {
-            const options = await optionsPromise;
-            const result = await (await this.actorPromise).sendAsync({type: MessageType.loadData, data: options});
-            this._isUpdatingWorker = false;
-
-            if (this._removed || result.abandoned) {
-                this.fire(new MapSourceDataEvent('dataabort'));
-                return;
-            }
-
-            // Update the copy of the data in this source with the worker result. (only sent for url based geojson data)
-            if (result.data) {
-                this._data = {geojson: result.data};
-            }
-
-            const affectedGeometries = this._applyDiffToSource(options.dataDiff);
-            const shouldReloadTileOptions = this._getShouldReloadTileOptions(affectedGeometries);
-
-            const eventData: {resourceTiming?: PerformanceResourceTiming[]} = {};
-            this._applyResourceTiming(eventData, result);
-
-            // Fire the metadata event to let the TileManager know it's ok to start requesting tiles.
-            this.fire(new MapSourceDataEvent('data', {...eventData, sourceDataType: 'metadata'}));
-            this.fire(new MapSourceDataEvent('data', {...eventData, sourceDataType: 'content', shouldReloadTileOptions}));
-        } catch (err) {
-            this._isUpdatingWorker = false;
-
-            if (this._removed) {
-                this.fire(new MapSourceDataEvent('dataabort'));
-                return;
-            }
-
-            this.fire(new ErrorEvent(ensureError(err)));
-        } finally {
-            // If there is more pending data, update the worker again.
-            if (this._hasPendingWorkerUpdate()) {
-                await this._updateWorkerData();
-            }
-        }
+        this.fire(new ErrorEvent(ensureError(error)));
     }
 
     /**
@@ -622,7 +583,7 @@ export class GeoJSONSource extends Evented<SourceEventType> implements Source {
     }
 
     loaded(): boolean {
-        return !this._isUpdatingWorker && !this._hasPendingWorkerUpdate();
+        return this._workerUpdates.idle;
     }
 
     async loadTile(tile: Tile): Promise<void> {
