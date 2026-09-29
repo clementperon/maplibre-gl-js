@@ -1,0 +1,36 @@
+name: Prerelease package
+
+# Builds the package from a `prerelease-v<version>` tag and attaches it to a GitHub
+# prerelease, so it can be installed from the release asset's URL. These are unofficial
+# builds of a released version with changes that are not released yet.
+
+on:
+  push:
+    tags: ['prerelease-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v4
+        with:
+          node-version-file: '.nvmrc'
+      - run: npm ci
+      - run: npx vitest run --config vitest.config.unit.ts src/source src/util/update_queue.test.ts
+      - run: npm run build-dist
+      - name: Set the version from the tag
+        run: npm version --no-git-tag-version "${GITHUB_REF_NAME#prerelease-v}"
+      - run: npm pack
+      - name: Create the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#prerelease-v}"
+          gh release create "$GITHUB_REF_NAME" "maplibre-gl-${version}.tgz" \
+            --prerelease \
+            --title "${version%%-*} with #8585 (unofficial build)" \
+            --notes "Unofficial build: v${version%%-*} with the changes of https://github.com/maplibre/maplibre-gl-js/pull/8585, which is not merged yet. Install it from the attached package's URL."
